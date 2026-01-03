@@ -1,8 +1,7 @@
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -50,10 +49,7 @@ fn validate_path(path: PathBuf) -> Result<PathBuf, AppError> {
 
 fn read_directory(path: &PathBuf) -> Result<Vec<fs::DirEntry>, AppError> {
     let mut entries_vec = Vec::new();
-
-    let entries = fs::read_dir(path)?;
-
-    for entry in entries {
+    for entry in fs::read_dir(path)? {
         let entry = entry?;
         entries_vec.push(entry);
     }
@@ -85,5 +81,116 @@ fn run() -> Result<(), AppError> {
 fn main() {
     if let Err(e) = run() {
         eprintln!("{}", e);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::fs::{self, File};
+    use tempfile::NamedTempFile;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_args_user_input_none_returns_err() {
+        let args = vec!["treer".to_string()];
+
+        assert!(matches!(parse_args(&args), Err(AppError::InvalidArgs)));
+    }
+
+    #[test]
+    fn parse_args_user_input_multiple_returns_err() {
+        let args = vec!["treer".to_string(), "-a".to_string(), ".".to_string()];
+
+        assert!(matches!(parse_args(&args), Err(AppError::InvalidArgs)));
+    }
+
+    #[test]
+    fn parse_args_user_input_one_returns_ok() {
+        let args = vec!["treer".to_string(), ".".to_string()];
+
+        let path = parse_args(&args).unwrap();
+        assert_eq!(path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn validate_path_existing_directory_returns_ok() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let result = validate_path(path.clone());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), path);
+    }
+
+    #[test]
+    fn validate_path_nonexistent_path_returns_err() {
+        let temp_dir = tempdir().unwrap();
+        let non_existent_path = temp_dir.path().join("foo");
+
+        let result = validate_path(non_existent_path);
+        assert!(matches!(result, Err(AppError::PathNotFound)));
+    }
+
+    #[test]
+    fn validate_path_file_returns_err() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let result = validate_path(path);
+        assert!(matches!(result, Err(AppError::NotADirectory)));
+    }
+
+    #[test]
+    #[ignore]
+    fn validate_path_permission_denied_returns_err() {}
+
+    #[test]
+    fn read_directory_empty_directory_returns_ok() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let entries = read_directory(&path).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn read_directory_with_file_returns_ok() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // ファイルを作成
+        File::create(path.join("file1.txt")).unwrap();
+        File::create(path.join("file2.txt")).unwrap();
+
+        let entries = read_directory(&path).unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert!(names.contains(&"file1.txt".to_string()));
+        assert!(names.contains(&"file2.txt".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn read_directory_with_subdirectories_returns_ok() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // サブディレクトリを作成
+        fs::create_dir(path.join("sub1")).unwrap();
+        fs::create_dir(path.join("sub2")).unwrap();
+
+        let entries = read_directory(&path).unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert!(names.contains(&"sub1".to_string()));
+        assert!(names.contains(&"sub2".to_string()));
+        assert_eq!(names.len(), 2);
     }
 }

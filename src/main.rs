@@ -2,13 +2,14 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 enum AppError {
     InvalidArgs,
-    PathNotFound,
-    NotADirectory,
+    PathNotFound(PathBuf),
+    NotADirectory(PathBuf),
+    PermissionDenied(PathBuf),
     Io(io::Error),
 }
 
@@ -22,45 +23,46 @@ impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AppError::InvalidArgs => write!(f, "invalid arguments"),
-            AppError::PathNotFound => write!(f, "path not found"),
-            AppError::NotADirectory => write!(f, "not a directory"),
+            AppError::PathNotFound(path) => write!(f, "path not found: {}", path.display()),
+            AppError::NotADirectory(path) => write!(f, "not a directory: {}", path.display()),
+            AppError::PermissionDenied(path) => write!(f, "permission denied: {}", path.display()),
             AppError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
 }
 
-fn map_metadata_error(e: io::Error) -> AppError {
-    match e.kind() {
-        ErrorKind::NotFound => AppError::PathNotFound,
-        ErrorKind::PermissionDenied => AppError::Io(e),
-        _ => AppError::Io(e),
-    }
-}
+fn validate_path<P: AsRef<Path>>(path: P) -> Result<(), AppError> {
+    let path_ref = path.as_ref();
 
-fn validate_path(path: PathBuf) -> Result<PathBuf, AppError> {
-    let metadata = fs::metadata(&path).map_err(map_metadata_error)?;
+    let metadata = fs::metadata(path_ref).map_err(|e| match e.kind() {
+        ErrorKind::NotFound => AppError::PathNotFound(path_ref.to_path_buf()),
+        _ => AppError::Io(e),
+    })?;
 
     if !metadata.is_dir() {
-        return Err(AppError::NotADirectory);
+        return Err(AppError::NotADirectory(path_ref.to_path_buf()));
     }
 
-    Ok(path)
+    Ok(())
 }
 
-fn read_directory(path: &PathBuf) -> Result<Vec<fs::DirEntry>, AppError> {
-    let mut entries_vec = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        entries_vec.push(entry);
-    }
-
-    Ok(entries_vec)
+fn read_directory<P: AsRef<Path>>(path: P) -> Result<Vec<fs::DirEntry>, AppError> {
+    let path_ref = path.as_ref();
+    fs::read_dir(path_ref)
+        .map_err(|e| match e.kind() {
+            ErrorKind::PermissionDenied => AppError::PermissionDenied(path_ref.to_path_buf()),
+            _ => AppError::Io(e),
+        })?
+        .map(|res| {
+            res.map_err(AppError::from)
+        })
+        .collect()
 }
 
 fn parse_args(args: &[String]) -> Result<PathBuf, AppError> {
     let count = args.len();
     match count {
-        2 => Ok(args[1].clone().into()),
+        2 => Ok(PathBuf::from(&args[1])),
         _ => Err(AppError::InvalidArgs),
     }
 }
@@ -68,7 +70,8 @@ fn parse_args(args: &[String]) -> Result<PathBuf, AppError> {
 fn run() -> Result<(), AppError> {
     let args: Vec<String> = env::args().collect();
     let path = parse_args(&args)?;
-    let path = validate_path(path)?;
+
+    validate_path(&path)?;
     let entries = read_directory(&path)?;
 
     for entry in entries {
@@ -115,12 +118,11 @@ mod test {
 
     #[test]
     fn validate_path_existing_directory_returns_ok() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path();
 
-        let result = validate_path(path.clone());
+        let result = validate_path(path);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), path);
     }
 
     #[test]
@@ -129,7 +131,7 @@ mod test {
         let non_existent_path = temp_dir.path().join("foo");
 
         let result = validate_path(non_existent_path);
-        assert!(matches!(result, Err(AppError::PathNotFound)));
+        assert!(matches!(result, Err(AppError::PathNotFound(_))));
     }
 
     #[test]
@@ -138,9 +140,10 @@ mod test {
         let path = temp_file.path().to_path_buf();
 
         let result = validate_path(path);
-        assert!(matches!(result, Err(AppError::NotADirectory)));
+        assert!(matches!(result, Err(AppError::NotADirectory(_))));
     }
 
+    // TODO: テストを動かす方法があれば作成する
     #[test]
     #[ignore]
     fn validate_path_permission_denied_returns_err() {}
@@ -148,22 +151,22 @@ mod test {
     #[test]
     fn read_directory_empty_directory_returns_ok() {
         let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
+        let path = dir.path();
 
-        let entries = read_directory(&path).unwrap();
+        let entries = read_directory(path).unwrap();
         assert!(entries.is_empty());
     }
 
     #[test]
     fn read_directory_with_file_returns_ok() {
         let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
+        let path = dir.path();
 
         // ファイルを作成
         File::create(path.join("file1.txt")).unwrap();
         File::create(path.join("file2.txt")).unwrap();
 
-        let entries = read_directory(&path).unwrap();
+        let entries = read_directory(path).unwrap();
         let names: Vec<_> = entries
             .iter()
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -177,13 +180,12 @@ mod test {
     #[test]
     fn read_directory_with_subdirectories_returns_ok() {
         let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
+        let path = dir.path();
 
-        // サブディレクトリを作成
         fs::create_dir(path.join("sub1")).unwrap();
         fs::create_dir(path.join("sub2")).unwrap();
 
-        let entries = read_directory(&path).unwrap();
+        let entries = read_directory(path).unwrap();
         let names: Vec<_> = entries
             .iter()
             .map(|e| e.file_name().to_string_lossy().to_string())
